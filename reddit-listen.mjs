@@ -39,6 +39,7 @@
  *   node reddit-listen.mjs --json          # machine readable
  *   node reddit-listen.mjs --misses        # and what the patterns threw away
  *   node reddit-listen.mjs --report        # also write the output to report.txt
+ *   node reddit-listen.mjs --rescore       # re-run the scoring over the last run's posts, no fetching
  *
  * "Reddit listener.cmd" is what the Desktop shortcut points at: it opens
  * the last report.txt if there is one and offers a fresh run.
@@ -64,102 +65,135 @@ const SEEN_PATH = path.join(HERE, ".reddit-seen.json");
 const UA = "web:visit-history-listen:1.0 (by /u/VisitHistory)";
 const RSS_UA = "visit-history-listen/1.0 (read-only RSS; contact support@visithistory.online)";
 const REPORT_PATH = path.join(HERE, "report.txt");
+// Everything the last run fetched, so the scoring can be re-run with
+// --rescore in seconds rather than another hour of feeds.
+const DUMP_PATH = path.join(HERE, "last-posts.json");
 
 /**
- * Where the people are. The first group is validated: these are the
- * communities the two paid tests actually ran against. The rest are the
- * places the questions get asked.
+ * Where the people are. The specialist subreddits are about this subject,
+ * so anything matched there is in context. The general ones are where the
+ * questions get asked among everything else, so a match there has to
+ * mention the subject too (see HERITAGE below).
  */
-const SUBREDDITS = [
-  // from the ad tests
+const SPECIALIST = [
   "castles", "Tudorhistory", "UKhistory", "nationaltrust", "EnglishHeritage",
-  "Archaeology", "MapPorn", "oldmaps", "OSmaps", "lidar",
-  // where the questions live
-  "AskUK", "CasualUK", "uktravel", "HistoryofIdeas", "AskBrits",
-  "britishproblems", "walkingbritain", "hiking", "metaldetectinguk",
+  "Archaeology", "oldmaps", "OSmaps", "lidar", "metaldetectinguk",
 ];
+const GENERAL = [
+  "MapPorn", "AskUK", "CasualUK", "uktravel", "HistoryofIdeas", "AskBrits",
+  "britishproblems", "walkingbritain", "hiking",
+];
+const SUBREDDITS = [...SPECIALIST, ...GENERAL];
+
+/**
+ * A post from anywhere but a specialist subreddit has to be about the
+ * subject somewhere in its first few hundred characters. The first live
+ * run (19 Oct 2026) ranked r/offmychest, r/HFY and r/fastfood at the top:
+ * a pattern like "keep track ... places" matches most long prose.
+ */
+const HERITAGE = /\b(castles?|heritage|historic|listed buildings?|scheduled monuments?|earthworks?|hill ?forts?|national trust|english heritage|cadw|abbey|priory|ruins?|lidar|archaeolog\w*|motte|barrows?|tumulus|crop ?marks?|ridge and furrow|grade (i|ii|1|2)\*? listed|stately home)\b/i;
 
 /**
  * High-intent phrasing, grouped so the report can say *why* a thread
  * matched. Order matters: the first group is where the product is the
  * literal answer to the question asked.
+ *
+ * Queries are what the search runs. **Quote the phrase.** Reddit's search
+ * treats bare words as any-of: `keep track of castles visited` returned a
+ * hundred posts about anything with "track" or "visited" in it, and the
+ * first run's 29 unquoted searches brought back 1,982 posts of which none
+ * was worth reading. `"is there an app" castles` returned three, all on
+ * subject.
+ *
+ * Patterns are what keeps a result. The gap between the two halves is
+ * bounded (`.{0,60}`) rather than `.*`, because across a whole post `.*`
+ * is a different question: "is there a map" and "castle" somewhere in the
+ * same two thousand words.
  */
 const INTENT = [
   {
     tag: "asking for an app",
     weight: 10,
     queries: [
-      "is there an app heritage", "app for castles", "app to track places visited",
-      "app for historic sites", "app national trust english heritage",
-      "best app for visiting castles",
+      "\"is there an app\" castles", "\"is there an app\" heritage",
+      "\"is there an app\" \"historic sites\"", "\"app for\" castles",
+      "\"app for\" \"english heritage\"", "\"app for\" \"national trust\"",
+      "\"best app\" castles", "\"any apps\" heritage sites",
     ],
     patterns: [
-      /\b(is|are) there (an?|any) app\b/i,
-      /\bapp (that|which|to|for)\b.*\b(castle|heritage|historic|monument|abbey|ruin)/i,
-      /\bany (good )?apps?\b.*\b(heritage|historic|castle|history)/i,
-      /\brecommend (an?|any) app\b/i,
+      /\b(is|are) there (an?|any) (good |decent )?apps?\b/i,
+      /\bapps? (that|which|to|for)\b.{0,60}\b(castles?|heritage|historic|monuments?|abbey|ruins?|national trust|english heritage)/i,
+      /\bany (good |decent )?apps?\b.{0,60}\b(heritage|historic|castles?|history)/i,
+      /\brecommend (an?|any|some) apps?\b/i,
     ],
   },
   {
     tag: "asking for a map",
     weight: 9,
     queries: [
-      "map of listed buildings", "map of scheduled monuments",
-      "is there a map of historic sites", "map of castles uk",
-      "map of earthworks", "lidar map uk how to",
+      "\"map of listed buildings\"", "\"map of scheduled monuments\"",
+      "\"map of\" \"historic sites\" uk", "\"map of\" castles uk",
+      "\"map of\" earthworks", "\"lidar\" \"how do i\" earthworks",
+      "\"interactive map\" \"listed buildings\"",
     ],
     patterns: [
-      /\b(is|are) there a (map|database|list)\b.*\b(listed|scheduled|monument|heritage|historic|castle)/i,
-      /\bwhere can i (find|see|get)\b.*\b(lidar|listed building|scheduled monument)/i,
-      /\bhow (do|can) i (find|see|check)\b.*\b(lidar|listed|scheduled|earthwork)/i,
+      /\b(is|are) there an? (map|database|list|website|site)\b.{0,60}\b(listed|scheduled|monuments?|heritage|historic|castles?|earthworks?)/i,
+      /\bwhere can (i|you) (find|see|get|view)\b.{0,60}\b(lidar|listed buildings?|scheduled monuments?|earthworks?)/i,
+      /\bhow (do|can) (i|you) (find|see|check|view)\b.{0,60}\b(lidar|listed|scheduled|earthworks?)/i,
     ],
   },
   {
     tag: "identify this earthwork",
     weight: 8,
     queries: [
-      "what is this earthwork", "lumps and bumps field", "crop marks field",
-      "what are these rings in the field", "is this a motte",
+      "\"what is this\" earthwork", "\"lumps and bumps\" field", "\"crop marks\" field",
+      "\"what are these\" rings field", "\"is this a\" motte", "\"is this an\" earthwork",
     ],
     patterns: [
-      /\bwhat (is|are) (this|these)\b.*\b(earthwork|mound|lump|bump|ditch|ring|crop ?mark|motte)/i,
-      /\bany idea what (this|these)\b.*\b(field|mound|earthwork)/i,
+      /\bwhat (is|are) (this|these)\b.{0,60}\b(earthworks?|mounds?|lumps?|bumps?|ditch|rings?|crop ?marks?|motte|banks?)/i,
+      /\bany idea what (this|these)\b.{0,60}\b(field|mound|earthwork)/i,
+      /\bis this an? (earthwork|motte|hill ?fort|barrow|tumulus|moat)\b/i,
     ],
   },
   {
     tag: "listed or scheduled question",
     weight: 7,
     queries: [
-      "how do i know if my house is listed", "what does scheduled monument mean",
-      "difference between listed and scheduled", "grade 2 listed what does it mean",
+      "\"is my house listed\"", "\"if my house is listed\"",
+      "\"what does scheduled monument mean\"", "\"listed and scheduled\"",
+      "\"grade 2 listed\" \"what does\"", "\"grade ii listed\" mean",
     ],
     patterns: [
-      /\b(how do i|how can i)\b.*\b(find out|check|know)\b.*\blisted\b/i,
-      /\bdifference between\b.*\b(listed|scheduled)\b/i,
+      /\b(how do i|how can i|how to)\b.{0,40}\b(find out|check|know|tell)\b.{0,40}\blisted\b/i,
+      /\bdifference between\b.{0,40}\b(listed|scheduled)\b/i,
       /\bwhat (does|is) a? ?scheduled monument\b/i,
+      /\bis (my|our|this) (house|home|building|property|cottage) listed\b/i,
+      /\bgrade (i|ii|1|2)\*? listed\b.{0,60}\b(mean|what|can i|can we|allowed)/i,
     ],
   },
   {
     tag: "membership worth it",
     weight: 5,
     queries: [
-      "national trust membership worth it", "english heritage membership worth it",
-      "national trust or english heritage", "historic houses membership",
+      "\"national trust membership\" worth", "\"english heritage membership\" worth",
+      "\"national trust or english heritage\"", "\"english heritage or national trust\"",
+      "\"historic houses membership\"",
     ],
     patterns: [
-      /\b(national trust|english heritage|historic houses|cadw)\b.*\bworth it\b/i,
-      /\b(national trust|english heritage)\b.*\bor\b.*\b(english heritage|national trust)\b/i,
+      /\b(national trust|english heritage|historic houses|cadw)\b.{0,80}\bworth (it|the)\b/i,
+      /\b(national trust|english heritage)\b.{0,30}\bor\b.{0,30}\b(english heritage|national trust)\b/i,
     ],
   },
   {
     tag: "keeping track of visits",
     weight: 6,
     queries: [
-      "keep track of castles visited", "log places visited", "tick off places visited",
-      "how do you record places you have been",
+      "\"keep track of\" castles visited", "\"places I've visited\" app",
+      "\"log\" \"places visited\" app", "\"tick off\" castles",
+      "\"national trust\" \"keep track\" visited",
     ],
     patterns: [
-      /\b(keep track|keeping track|log|record|tick off)\b.*\b(visited|been to|places|castles|properties)/i,
+      /\b(keep track|keeping track|log|record|tick off|ticking off)\b.{0,40}\b(castles?|properties|sites|places (i|we)('ve| have) (visited|been))/i,
     ],
   },
 ];
@@ -325,9 +359,14 @@ function decodeEntities(s) {
     .replace(/&amp;/g, "&");
 }
 
+const specialist = new Set(SPECIALIST.map((s) => s.toLowerCase()));
+
 function score(post) {
   const hay = `${post.title}\n${post.selftext ?? ""}`;
   if (NEGATIVE.some((re) => re.test(hay))) return null;
+  // Outside the specialist subreddits the post has to be about the subject,
+  // and near the top, not in paragraph nine.
+  if (!specialist.has(post.subreddit.toLowerCase()) && !HERITAGE.test(hay.slice(0, 800))) return null;
 
   let best = null;
   for (const group of INTENT) {
@@ -365,6 +404,7 @@ async function main() {
   const includeSeen = Boolean(arg("all", false));
   const showMisses = Boolean(arg("misses", false));
   const writeReport = Boolean(arg("report", false));
+  const rescore = Boolean(arg("rescore", false));
   const cutoff = Date.now() / 1000 - days * 86400;
   const period = days > 30 ? "year" : "month";
 
@@ -407,12 +447,26 @@ async function main() {
     };
   }
 
-  const found = new Map();
+  let found = new Map();
+  let foundBy = new Map();
+  const shortfalls = [];
+
+  // --rescore skips the fetching and reruns the scoring over what the
+  // last run saved, which is how the patterns get tuned without an hour
+  // of feeds per attempt. The window is the one that run asked for.
+  if (rescore) {
+    if (!fs.existsSync(DUMP_PATH)) throw new Error(`--rescore needs ${DUMP_PATH}, which a run writes.`);
+    const dump = JSON.parse(fs.readFileSync(DUMP_PATH, "utf8"));
+    found = new Map(dump.posts.map((p) => [p.id, p]));
+    foundBy = new Map(dump.foundBy);
+    shortfalls.push(...dump.shortfalls);
+    failures.push(...dump.failures);
+    console.error(`Rescoring ${found.size} posts fetched ${dump.fetchedAt} over the ${dump.source === "api" ? "API" : "public feeds"}.\n`);
+  }
 
   // 1. Targeted search across all of Reddit, which catches the subreddits
   //    nobody thought to list.
-  const foundBy = new Map();
-  for (const q of queries) {
+  for (const q of rescore ? [] : queries) {
     for (const post of await search(q)) {
       found.set(post.id, post);
       if (!foundBy.has(post.id)) foundBy.set(post.id, q);
@@ -424,8 +478,7 @@ async function main() {
   //    is a few hours, so this pages back until it passes the cutoff, and
   //    says so where it could not: Reddit ends a listing at about a
   //    thousand posts whatever is asked for.
-  const shortfalls = [];
-  for (const sub of SUBREDDITS) {
+  for (const sub of rescore ? [] : SUBREDDITS) {
     let after = null;
     let oldest = null;
     let count = 0;
@@ -447,28 +500,51 @@ async function main() {
     }
   }
 
+  if (!rescore) {
+    fs.writeFileSync(DUMP_PATH, JSON.stringify({
+      fetchedAt: new Date().toISOString(), days, source,
+      posts: [...found.values()], foundBy: [...foundBy], shortfalls, failures,
+    }));
+  }
+
+  // The same post put in ten subreddits is one thread to read, not ten.
   const hits = [];
   const misses = [];
+  const byTitle = new Map();
   for (const post of found.values()) {
     if (post.created_utc < cutoff) continue;
     if (!includeSeen && seen.has(post.id)) continue;
-    // Nothing can be said in a thread that is locked, archived or removed.
+    // Nothing can be said in a thread that is locked, archived or removed,
+    // and a user-profile "subreddit" (u_name) is somebody's own noticeboard.
     if (post.locked || post.archived || post.removed_by_category) continue;
+    if (post.subreddit.startsWith("u_")) continue;
     const s = score(post);
     if (!s) {
       if (foundBy.has(post.id)) misses.push(post);
       continue;
     }
-    hits.push({
+    const hit = {
       id: post.id,
       score: s.score,
       why: s.why,
       age: `${s.ageDays.toFixed(1)}d`,
       sub: `r/${post.subreddit}`,
+      alsoIn: [],
       comments: post.num_comments,
       title: post.title,
       url: `https://www.reddit.com${post.permalink}`,
-    });
+    };
+    const key = post.title.toLowerCase().replace(/\s+/g, " ").trim();
+    const prior = byTitle.get(key);
+    if (!prior) {
+      byTitle.set(key, hit);
+      hits.push(hit);
+    } else if (hit.score > prior.score) {
+      prior.alsoIn.push(prior.sub);
+      Object.assign(prior, hit, { alsoIn: prior.alsoIn });
+    } else {
+      prior.alsoIn.push(hit.sub);
+    }
   }
   hits.sort((a, b) => b.score - a.score);
 
@@ -486,7 +562,8 @@ async function main() {
   } else {
     say(`${hits.length} threads worth a look, best first:\n`);
     for (const h of hits) {
-      say(`[${String(h.score).padStart(2)}] ${h.sub}  ${h.age}  ${comments(h.comments)}(${h.why})`);
+      const also = h.alsoIn.length ? `  also in ${h.alsoIn.join(", ")}` : "";
+      say(`[${String(h.score).padStart(2)}] ${h.sub}  ${h.age}  ${comments(h.comments)}(${h.why})${also}`);
       say(`     ${h.title}`);
       say(`     ${h.url}\n`);
     }

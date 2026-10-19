@@ -2,4 +2,6 @@
 .reddit-seen.json
 report.txt
 run.log
+last-posts.json
+probe-search.log
 node_modules/
