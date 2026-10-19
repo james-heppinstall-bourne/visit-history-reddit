@@ -4,11 +4,26 @@
  *
  * Reddit blocks anonymous JSON entirely now (403 on every .json endpoint,
  * which is also why a bare curl check reports real subreddits as missing).
- * This uses the official API with the **userless** OAuth grant: a client id
- * and a device id, no password, no account actions. Read only by
- * construction - nothing here can post, vote or comment.
+ * Two ways in, chosen by whether REDDIT_CLIENT_ID is set:
  *
- * Setup, once, by the account owner:
+ *   API  The official API with the **userless** OAuth grant: a client id
+ *        and a device id, no password, no account actions. Fast: a run is
+ *        a minute or two. Needs an app, and since 2025 Reddit will not
+ *        create one until the account is approved under its Responsible
+ *        Builder Policy (the "register to use the API" link on the
+ *        create-app form). Measured 19 Oct 2026: the create call answers
+ *        success:true and does nothing until then.
+ *   RSS  The public Atom feeds at www.reddit.com, no credentials at all.
+ *        Allowed **one request a minute** from an address (measured the
+ *        same day: x-ratelimit-remaining is 0 after a single call), so a
+ *        run is 50 to 60 requests and takes most of an hour. Feeds carry no
+ *        comment count, so that part of the score is skipped. old.reddit.com
+ *        feeds redirect to a login page and are no use.
+ *
+ * Read only by construction either way - nothing here can post, vote or
+ * comment.
+ *
+ * Setup for the API route, once, by the account owner:
  *   1. https://www.reddit.com/prefs/apps  ->  "create another app..."
  *   2. Type: **installed app**  (not "script" - that one wants a password)
  *   3. Redirect uri: http://localhost:3000  (unused, but required)
@@ -23,9 +38,13 @@
  *   node reddit-listen.mjs --all           # include already-seen
  *   node reddit-listen.mjs --json          # machine readable
  *   node reddit-listen.mjs --misses        # and what the patterns threw away
+ *   node reddit-listen.mjs --report        # also write the output to report.txt
  *
- * "Reddit listener.cmd" runs it in a window that stays open, and is what
- * the Desktop shortcut points at.
+ * "Reddit listener.cmd" is what the Desktop shortcut points at: it opens
+ * the last report.txt if there is one and offers a fresh run.
+ * "Reddit listener (scheduled).cmd" is the unattended daily run behind
+ * report.txt, registered in Task Scheduler as "Visit History Reddit
+ * listener".
  *
  * Threads already reported are remembered in .reddit-seen.json next to this
  * file, so a daily run only shows what is new. That file is gitignored.
@@ -43,6 +62,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SEEN_PATH = path.join(HERE, ".reddit-seen.json");
 
 const UA = "web:visit-history-listen:1.0 (by /u/VisitHistory)";
+const RSS_UA = "visit-history-listen/1.0 (read-only RSS; contact support@visithistory.online)";
+const REPORT_PATH = path.join(HERE, "report.txt");
 
 /**
  * Where the people are. The first group is validated: these are the
@@ -143,8 +164,11 @@ const INTENT = [
   },
 ];
 
-/** Pages of a subreddit's /new to read, a hundred posts each. */
-const MAX_PAGES = 10;
+/**
+ * Pages of a subreddit's /new to read, a hundred posts each. Fewer over RSS,
+ * where every page is another minute.
+ */
+const MAX_PAGES = { api: 10, rss: 3 };
 const MAX_MISSES = 80;
 
 const NEGATIVE = [
@@ -229,6 +253,78 @@ async function api(tok, pathname, params, attempt = 0) {
   return r.json();
 }
 
+/**
+ * The RSS route. One Atom feed per request, and Reddit allows an
+ * anonymous address one request a minute, so this reads the window
+ * headers and waits rather than being refused. Progress goes to stderr
+ * because an hour of silence looks like a hang.
+ */
+let rssDone = 0;
+let rssPlanned = 0;
+
+async function rss(url, what, attempt = 0) {
+  const r = await fetch(url, { headers: { "User-Agent": RSS_UA } });
+  const text = await r.text();
+  const reset = Math.min(Number(r.headers.get("x-ratelimit-reset")) || 60, 120);
+  if (r.status === 429 && attempt < 3) {
+    await sleep(reset + 1);
+    return rss(url, what, attempt + 1);
+  }
+  rssDone++;
+  if (!r.ok || !text.includes("<feed")) {
+    failures.push({ status: r.ok ? "not a feed" : r.status, what });
+    return [];
+  }
+  const posts = parseAtom(text);
+  const left = r.headers.get("x-ratelimit-remaining");
+  if (left !== null && Number(left) < 1) {
+    process.stderr.write(
+      `  ${what}: ${posts.length} posts. ${rssDone} of about ${rssPlanned} requests done; ` +
+      `the next is allowed in ${reset}s.\n`,
+    );
+    await sleep(reset + 1);
+  }
+  return posts;
+}
+
+/** The same post shape the API gives, from an Atom feed. */
+function parseAtom(xml) {
+  const posts = [];
+  for (const m of xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)) {
+    const e = m[1];
+    const id = atomTag(e, "id");
+    // A search feed lists matching subreddits (t5_) alongside posts (t3_).
+    if (!id?.startsWith("t3_")) continue;
+    const content = decodeEntities(atomTag(e, "content") ?? "");
+    // Reddit wraps a self post's text in SC_OFF/SC_ON comments; a link post
+    // has only the thumbnail and the "[link] [comments]" trailer.
+    const isSelf = /SC_OFF/.test(content);
+    const link = e.match(/<link href="([^"]+)"/)?.[1] ?? "https://www.reddit.com/";
+    const when = atomTag(e, "published") ?? atomTag(e, "updated") ?? "";
+    posts.push({
+      id: id.slice(3),
+      title: decodeEntities(atomTag(e, "title") ?? ""),
+      selftext: isSelf ? decodeEntities(content.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim() : "",
+      is_self: isSelf,
+      num_comments: null,
+      created_utc: Date.parse(when) / 1000,
+      permalink: new URL(link).pathname,
+      subreddit: e.match(/<category term="([^"]+)"/)?.[1] ?? "",
+    });
+  }
+  return posts;
+}
+
+const atomTag = (entry, name) =>
+  entry.match(new RegExp(`<${name}(?: [^>]*)?>([\\s\\S]*?)</${name}>`))?.[1];
+
+function decodeEntities(s) {
+  return s
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(n))
+    .replace(/&amp;/g, "&");
+}
+
 function score(post) {
   const hay = `${post.title}\n${post.selftext ?? ""}`;
   if (NEGATIVE.some((re) => re.test(hay))) return null;
@@ -243,12 +339,13 @@ function score(post) {
 
   // A question with few answers is worth more than a busy thread you are
   // arriving late to, and self-posts beat link posts because there is
-  // something to reply to.
+  // something to reply to. A feed does not say how many comments there
+  // are, so over RSS that part is skipped.
   let s = best.weight;
   if (/\?/.test(post.title)) s += 3;
   if (post.is_self) s += 2;
   if (post.num_comments === 0) s += 2;
-  else if (post.num_comments < 5) s += 1;
+  else if (post.num_comments !== null && post.num_comments < 5) s += 1;
   else if (post.num_comments > 40) s -= 3;
   const ageDays = (Date.now() / 1000 - post.created_utc) / 86400;
   if (ageDays < 1) s += 3;
@@ -261,38 +358,64 @@ function score(post) {
 async function main() {
   const env = { ...loadEnv(), ...process.env };
   const clientId = env.REDDIT_CLIENT_ID;
-  if (!clientId) {
-    console.error(
-      "REDDIT_CLIENT_ID is not set. See the header of this file for the\n" +
-      "four steps to create one. It is read only and needs no password.",
-    );
-    process.exit(1);
-  }
+  const source = clientId ? "api" : "rss";
 
   const days = Number(arg("days", 7));
   const asJson = Boolean(arg("json", false));
   const includeSeen = Boolean(arg("all", false));
   const showMisses = Boolean(arg("misses", false));
+  const writeReport = Boolean(arg("report", false));
   const cutoff = Date.now() / 1000 - days * 86400;
+  const period = days > 30 ? "year" : "month";
 
   const seen = includeSeen
     ? new Set()
     : new Set(fs.existsSync(SEEN_PATH) ? JSON.parse(fs.readFileSync(SEEN_PATH, "utf8")) : []);
 
-  const tok = await token(clientId, env.REDDIT_CLIENT_SECRET);
+  const queries = INTENT.flatMap((g) => g.queries);
+
+  // The two routes answer the same two questions: what does a search return,
+  // and what is on a page of a subreddit's /new. Everything after is shared.
+  let search;
+  let listPage;
+  if (source === "api") {
+    const tok = await token(clientId, env.REDDIT_CLIENT_SECRET);
+    search = async (q) => {
+      const j = await api(tok, "/search", { q, limit: "100", sort: "new", t: period, type: "link" });
+      return (j.data?.children ?? []).map((c) => c.data);
+    };
+    listPage = async (sub, after) => {
+      const j = await api(tok, `/r/${sub}/new`, { limit: "100", ...(after ? { after } : {}) });
+      return { posts: (j.data?.children ?? []).map((c) => c.data), after: j.data?.after ?? null };
+    };
+  } else {
+    rssPlanned = queries.length + SUBREDDITS.length;
+    console.error(
+      `No REDDIT_CLIENT_ID, so reading Reddit's public feeds instead: about ${rssPlanned} requests ` +
+      `at the one a minute Reddit allows, so most of an hour. See the header of this file.\n`,
+    );
+    search = (q) => rss(
+      `https://www.reddit.com/search.rss?q=${encodeURIComponent(q)}&sort=new&t=${period}&limit=100`,
+      `search "${q}"`,
+    );
+    listPage = async (sub, after) => {
+      const posts = await rss(
+        `https://www.reddit.com/r/${sub}/new.rss?limit=100${after ? `&after=${after}&count=100` : ""}`,
+        `/r/${sub}/new${after ? ` after ${after}` : ""}`,
+      );
+      return { posts, after: posts.length ? `t3_${posts[posts.length - 1].id}` : null };
+    };
+  }
+
   const found = new Map();
 
   // 1. Targeted search across all of Reddit, which catches the subreddits
   //    nobody thought to list.
-  const queries = INTENT.flatMap((g) => g.queries);
   const foundBy = new Map();
   for (const q of queries) {
-    const j = await api(tok, "/search", {
-      q, limit: "100", sort: "new", t: days > 30 ? "year" : "month", type: "link",
-    });
-    for (const c of j.data?.children ?? []) {
-      found.set(c.data.id, c.data);
-      if (!foundBy.has(c.data.id)) foundBy.set(c.data.id, q);
+    for (const post of await search(q)) {
+      found.set(post.id, post);
+      if (!foundBy.has(post.id)) foundBy.set(post.id, q);
     }
   }
 
@@ -306,14 +429,17 @@ async function main() {
     let after = null;
     let oldest = null;
     let count = 0;
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const j = await api(tok, `/r/${sub}/new`, { limit: "100", ...(after ? { after } : {}) });
-      for (const c of j.data?.children ?? []) {
-        found.set(c.data.id, c.data);
-        oldest = c.data.created_utc;
+    for (let page = 0; page < MAX_PAGES[source]; page++) {
+      const r = await listPage(sub, after);
+      // A page that adds nothing is a feed that ignored `after`; stop
+      // rather than read the same hundred posts three times.
+      if (!r.posts.some((p) => !found.has(p.id))) { after = null; break; }
+      for (const post of r.posts) {
+        found.set(post.id, post);
+        oldest = post.created_utc;
         count++;
       }
-      after = j.data?.after ?? null;
+      after = r.after;
       if (!after || oldest < cutoff) break;
     }
     if (oldest !== null && oldest > cutoff && (after || count >= 900)) {
@@ -346,18 +472,25 @@ async function main() {
   }
   hits.sort((a, b) => b.score - a.score);
 
+  // Everything printed is also kept for report.txt. Warnings go to stderr
+  // so --json stays parseable on stdout.
+  const lines = [];
+  const say = (s = "") => { lines.push(s); console.log(s); };
+  const warn = (s = "") => { lines.push(s); console.error(s); };
+  const comments = (n) => (n === null ? "" : `${n} comments  `);
+
   if (asJson) {
     console.log(JSON.stringify(hits, null, 2));
   } else if (hits.length === 0) {
-    console.log(`Nothing new in the last ${days} days.`);
+    say(`Nothing new in the last ${days} days.`);
   } else {
-    console.log(`${hits.length} threads worth a look, best first:\n`);
+    say(`${hits.length} threads worth a look, best first:\n`);
     for (const h of hits) {
-      console.log(`[${String(h.score).padStart(2)}] ${h.sub}  ${h.age}  ${h.comments} comments  (${h.why})`);
-      console.log(`     ${h.title}`);
-      console.log(`     ${h.url}\n`);
+      say(`[${String(h.score).padStart(2)}] ${h.sub}  ${h.age}  ${comments(h.comments)}(${h.why})`);
+      say(`     ${h.title}`);
+      say(`     ${h.url}\n`);
     }
-    console.log(
+    say(
       "Before replying, read E:/code/visit-history-web/docs/advertising/reddit-organic.md.\n" +
       "Answer the question first. Mention the app only if it is genuinely\n" +
       "the answer, and say you built it when you do.",
@@ -369,22 +502,30 @@ async function main() {
   if (showMisses && !asJson) {
     misses.sort((a, b) => b.created_utc - a.created_utc);
     const shown = misses.slice(0, MAX_MISSES);
-    console.log(`\n${shown.length} of ${misses.length} threads a search returned and no pattern kept, newest first:\n`);
+    say(`\n${shown.length} of ${misses.length} threads a search returned and no pattern kept, newest first:\n`);
     for (const p of shown) {
-      console.log(`     r/${p.subreddit}  ${p.num_comments} comments  (found by "${foundBy.get(p.id)}")`);
-      console.log(`     ${p.title}`);
-      console.log(`     https://www.reddit.com${p.permalink}\n`);
+      say(`     r/${p.subreddit}  ${comments(p.num_comments)}(found by "${foundBy.get(p.id)}")`);
+      say(`     ${p.title}`);
+      say(`     https://www.reddit.com${p.permalink}\n`);
     }
   }
 
-  // On stderr, so --json stays parseable.
   if (failures.length > 0) {
-    console.error(`\n${failures.length} requests failed, so the list above is short by whatever they would have found:`);
-    for (const f of failures) console.error(`  ${f.status}  ${f.what}`);
+    warn(`\n${failures.length} requests failed, so the list above is short by whatever they would have found:`);
+    for (const f of failures) warn(`  ${f.status}  ${f.what}`);
   }
   if (shortfalls.length > 0) {
-    console.error(`\nBusier than a listing reaches, so only part of the ${days} days was read:`);
-    for (const s of shortfalls) console.error(`  r/${s.sub}  back ${s.reached.toFixed(1)} days`);
+    warn(`\nBusier than a listing reaches, so only part of the ${days} days was read:`);
+    for (const s of shortfalls) warn(`  r/${s.sub}  back ${s.reached.toFixed(1)} days`);
+  }
+
+  if (writeReport) {
+    const stamp = new Date().toLocaleString("en-GB", { dateStyle: "full", timeStyle: "short" });
+    const header = `Reddit listener, ${stamp}. Last ${days} days${includeSeen ? "" : ", new only"}, ` +
+      `read over the ${source === "api" ? "API" : "public feeds"}.\n` +
+      "=".repeat(72) + "\n\n";
+    fs.writeFileSync(REPORT_PATH, header + lines.join("\n") + "\n");
+    console.error(`\nWritten to ${REPORT_PATH}`);
   }
 
   if (!includeSeen) {

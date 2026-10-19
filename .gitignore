@@ -1,3 +1,5 @@
 .env
 .reddit-seen.json
+report.txt
+run.log
 node_modules/
