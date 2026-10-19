@@ -5,6 +5,8 @@ somebody has already asked, and prints them ranked. Read only by
 construction: it cannot post, vote or comment.
 
 One file, no dependencies beyond Node 18 or later.
+Public at <https://github.com/james-heppinstall-bourne/visit-history-reddit>,
+which is the source link Reddit's API registration asks for.
 
 ## Two ways in
 
