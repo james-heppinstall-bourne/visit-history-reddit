@@ -1,0 +1,13 @@
+{
+  "name": "visit-history-reddit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Finds Reddit threads where Visit History is a genuine answer. Read only.",
+  "type": "module",
+  "scripts": {
+    "start": "node reddit-listen.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
