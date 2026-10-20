@@ -1,6 +1,0 @@
-No REDDIT_CLIENT_ID, so reading Reddit's public feeds instead: about 56 requests at the one a minute Reddit allows, so most of an hour. See the header of this file.
-
-  search ""is there an app" castles": 1 posts. 1 of about 56 requests done; the next is allowed in 23s.
-  search ""is there an app" heritage": 0 posts. 2 of about 56 requests done; the next is allowed in 58s.
-  search ""is there an app" "historic sites"": 0 posts. 3 of about 56 requests done; the next is allowed in 59s.
-  search ""app for" castles": 25 posts. 4 of about 56 requests done; the next is allowed in 59s.
