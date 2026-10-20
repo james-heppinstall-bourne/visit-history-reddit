@@ -29,9 +29,12 @@ It opens the last `report.txt` in Notepad, then asks whether to run a fresh
 search now.
 
 `report.txt` comes from **`Reddit listener (scheduled).cmd`**, which Task
-Scheduler runs daily at 05:00 as "Visit History Reddit listener" (last 7
-days, everything, not only what is new). It runs only while you are logged
-in. Its console output goes to `run.log`. To remove it:
+Scheduler runs daily at 09:00 as "Visit History Reddit listener" (last 7
+days, everything, not only what is new), or as soon as the machine is awake
+after a missed start. It runs only while you are logged in. It was 05:00
+until 20 Oct 2026, when the first run fired during a one-second wake from
+connected standby and died with no network. Its console output goes to
+`run.log`. To remove it:
 `schtasks /Delete /TN "Visit History Reddit listener" /F`.
 
 From a terminal in this folder:
