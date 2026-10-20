@@ -268,9 +268,9 @@ const failures = [];
 async function api(tok, pathname, params, attempt = 0) {
   const url = new URL(`https://oauth.reddit.com${pathname}`);
   for (const [k, v] of Object.entries(params ?? {})) url.searchParams.set(k, v);
-  const r = await fetch(url, {
+  const r = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${tok}`, "User-Agent": UA },
-  });
+  }, pathname);
   const reset = Math.min(Number(r.headers.get("x-ratelimit-reset")) || 5, 60);
   if (r.status === 429 && attempt < 3) {
     await sleep(reset);
@@ -296,8 +296,26 @@ async function api(tok, pathname, params, attempt = 0) {
 let rssDone = 0;
 let rssPlanned = 0;
 
+/**
+ * A request that never reached Reddit: no network yet after the machine
+ * woke, DNS not up, a dropped connection. The 05:00 run on 20 Oct 2026
+ * died on its very first request with "fetch failed" and wrote nothing,
+ * so this waits and tries again a few times before giving up.
+ */
+async function fetchWithRetry(url, options, what) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      if (attempt >= 5) throw new Error(`${what}: ${e.message} after ${attempt} attempts`);
+      process.stderr.write(`  ${what}: ${e.message}; trying again in 60s (${attempt} of 5)\n`);
+      await sleep(60);
+    }
+  }
+}
+
 async function rss(url, what, attempt = 0) {
-  const r = await fetch(url, { headers: { "User-Agent": RSS_UA } });
+  const r = await fetchWithRetry(url, { headers: { "User-Agent": RSS_UA } }, what);
   const text = await r.text();
   const reset = Math.min(Number(r.headers.get("x-ratelimit-reset")) || 60, 120);
   if (r.status === 429 && attempt < 3) {
