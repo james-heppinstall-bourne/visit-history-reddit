@@ -77,13 +77,31 @@ const DUMP_PATH = path.join(HERE, "last-posts.json");
  */
 const SPECIALIST = [
   "castles", "Tudorhistory", "UKhistory", "nationaltrust", "EnglishHeritage",
-  "Archaeology", "oldmaps", "OSmaps", "lidar", "metaldetectinguk",
+  "Archaeology", "oldmaps",
 ];
+// r/LiDAR is mostly industrial scanning and r/MetalDetectingUK is mostly
+// "what is this coin", so both have to mention the subject like anywhere
+// else: a castle ruin, an earthwork, a detecting site seen on LiDAR.
+// r/OSmaps answered 500 on both runs and is dropped.
 const GENERAL = [
-  "MapPorn", "AskUK", "CasualUK", "uktravel", "HistoryofIdeas", "AskBrits",
-  "britishproblems", "walkingbritain", "hiking",
+  "lidar", "metaldetectinguk", "MapPorn", "AskUK", "CasualUK", "uktravel",
+  "HistoryofIdeas", "AskBrits", "britishproblems", "walkingbritain", "hiking",
 ];
 const SUBREDDITS = [...SPECIALIST, ...GENERAL];
+
+/**
+ * r/nationaltrust and r/EnglishHeritage are small and entirely on subject,
+ * and over the 30 days to 20 Oct 2026 every question asked in them was
+ * one a member of the app's audience would ask: which property, is it
+ * included, worth a visit, how the membership works. Every question from
+ * them is shown, at a modest weight, rather than only the phrasings
+ * somebody guessed in advance.
+ */
+const QUESTION_SUBS = new Set(["nationaltrust", "englishheritage"]);
+const QUESTION = /\?|\b(any|anyone|recommend\w*|advice|help|where|how|what|which|is there|worth|tips|suggestions?)\b/i;
+// "Hughenden or Cliveden?" is a question only somewhere everyone knows
+// what those are; elsewhere it matches "LiDAR or cameras?".
+const EITHER_OR = /^\s*[\w' ]{3,40} (or|vs\.?) [\w' ]{3,40}\?/i;
 
 /**
  * A post from anywhere but a specialist subreddit has to be about the
@@ -116,9 +134,8 @@ const INTENT = [
     weight: 10,
     queries: [
       "\"is there an app\" castles", "\"is there an app\" heritage",
-      "\"is there an app\" \"historic sites\"", "\"app for\" castles",
-      "\"app for\" \"english heritage\"", "\"app for\" \"national trust\"",
-      "\"best app\" castles", "\"any apps\" heritage sites",
+      "\"app for\" castles", "\"best app\" castles",
+      "\"national trust\" app", "\"english heritage\" app",
     ],
     patterns: [
       /\b(is|are) there (an?|any) (good |decent )?apps?\b/i,
@@ -132,9 +149,7 @@ const INTENT = [
     weight: 9,
     queries: [
       "\"map of listed buildings\"", "\"map of scheduled monuments\"",
-      "\"map of\" \"historic sites\" uk", "\"map of\" castles uk",
-      "\"map of\" earthworks", "\"lidar\" \"how do i\" earthworks",
-      "\"interactive map\" \"listed buildings\"",
+      "\"map of\" castles uk",
     ],
     patterns: [
       /\b(is|are) there an? (map|database|list|website|site)\b.{0,60}\b(listed|scheduled|monuments?|heritage|historic|castles?|earthworks?)/i,
@@ -146,22 +161,44 @@ const INTENT = [
     tag: "identify this earthwork",
     weight: 8,
     queries: [
-      "\"what is this\" earthwork", "\"lumps and bumps\" field", "\"crop marks\" field",
-      "\"what are these\" rings field", "\"is this a\" motte", "\"is this an\" earthwork",
+      "\"what is this\" earthwork", "\"lumps and bumps\"", "\"crop marks\" field",
+      "\"is this a\" motte", "\"found on lidar\"",
     ],
     patterns: [
       /\bwhat (is|are) (this|these)\b.{0,60}\b(earthworks?|mounds?|lumps?|bumps?|ditch|rings?|crop ?marks?|motte|banks?)/i,
-      /\bany idea what (this|these)\b.{0,60}\b(field|mound|earthwork)/i,
+      /\b(any idea|anyone know|does anyone know|can (someone|anyone) tell me) what (this|these|it) (is|are|could be|might be)\b/i,
       /\bis this an? (earthwork|motte|hill ?fort|barrow|tumulus|moat)\b/i,
+      /\b(found|spotted|seen|noticed) (this |it |something )?on (the )?lidar\b/i,
+    ],
+  },
+  {
+    // Only the title, and only in the listed subreddits: an essay on a
+    // Tudor scandal says "worth visiting" in paragraph four, and a search
+    // result from r/VanLifeUK asks which shows are. The question is what
+    // the post is asking, which is the title's job.
+    tag: "where to go",
+    weight: 7,
+    titleOnly: true,
+    listedOnly: true,
+    queries: [],
+    patterns: [
+      /\bwhere (should|shall|could|can|do) (i|we) (go|visit|start)\b/i,
+      /\bwhere to go\b/i,
+      /\b(places?|sites?|castles?|properties|houses) to (go|visit|see)\b/i,
+      /\bbest (location|place|area|region|sites?|castles?|properties)\b/i,
+      /\brecommend\w*\b.{0,40}\b(places?|sites?|castles?|properties|abbeys?|visit)\b/i,
+      /\bworth (a |the )?(visit|visiting|seeing|going)\b/i,
+      /\b(things|what) to (do|see)\b/i,
+      /\b(day trips?|itinerary|road ?trip|stops on)\b/i,
+      /\bhas anyone (visited|been to)\b/i,
     ],
   },
   {
     tag: "listed or scheduled question",
     weight: 7,
     queries: [
-      "\"is my house listed\"", "\"if my house is listed\"",
-      "\"what does scheduled monument mean\"", "\"listed and scheduled\"",
-      "\"grade 2 listed\" \"what does\"", "\"grade ii listed\" mean",
+      "\"is my house listed\"", "\"what does scheduled monument mean\"",
+      "\"grade ii listed\" mean",
     ],
     patterns: [
       /\b(how do i|how can i|how to)\b.{0,40}\b(find out|check|know|tell)\b.{0,40}\blisted\b/i,
@@ -176,21 +213,22 @@ const INTENT = [
     weight: 5,
     queries: [
       "\"national trust membership\" worth", "\"english heritage membership\" worth",
-      "\"national trust or english heritage\"", "\"english heritage or national trust\"",
-      "\"historic houses membership\"",
+      "\"national trust or english heritage\"",
     ],
     patterns: [
       /\b(national trust|english heritage|historic houses|cadw)\b.{0,80}\bworth (it|the)\b/i,
       /\b(national trust|english heritage)\b.{0,30}\bor\b.{0,30}\b(english heritage|national trust)\b/i,
+      /\b(membership|member)\b.{0,60}\b(worth|includes?|included|cancel\w*|renew\w*|reciprocal|free entry|direct debit)\b/i,
+      /\b(includes?|included|cancel\w*|renew\w*|reciprocal|free entry|direct debit)\b.{0,60}\bmembership\b/i,
     ],
   },
   {
     tag: "keeping track of visits",
     weight: 6,
+    // Quoting a single common word ("log", "visited") is any-of again:
+    // two such queries returned 95 and 97 posts about nothing on 20 Oct.
     queries: [
-      "\"keep track of\" castles visited", "\"places I've visited\" app",
-      "\"log\" \"places visited\" app", "\"tick off\" castles",
-      "\"national trust\" \"keep track\" visited",
+      "\"keep track of\" castles visited", "\"tick off\" castles",
     ],
     patterns: [
       /\b(keep track|keeping track|log|record|tick off|ticking off)\b.{0,40}\b(castles?|properties|sites|places (i|we)('ve| have) (visited|been))/i,
@@ -378,6 +416,7 @@ function decodeEntities(s) {
 }
 
 const specialist = new Set(SPECIALIST.map((s) => s.toLowerCase()));
+const listedSubs = new Set(SUBREDDITS.map((s) => s.toLowerCase()));
 
 function score(post) {
   const hay = `${post.title}\n${post.selftext ?? ""}`;
@@ -386,11 +425,21 @@ function score(post) {
   // and near the top, not in paragraph nine.
   if (!specialist.has(post.subreddit.toLowerCase()) && !HERITAGE.test(hay.slice(0, 800))) return null;
 
+  const sub = post.subreddit.toLowerCase();
+  const listed = listedSubs.has(sub);
   let best = null;
   for (const group of INTENT) {
-    if (group.patterns.some((re) => re.test(hay))) {
+    if (group.listedOnly && !listed) continue;
+    const text = group.titleOnly ? post.title : hay;
+    if (group.patterns.some((re) => re.test(text))) {
       if (!best || group.weight > best.weight) best = group;
     }
+  }
+  // A question put to r/nationaltrust or r/EnglishHeritage is on subject by
+  // where it was asked. Self posts only: the link posts there are the
+  // organisations' own "did you see it?" announcements.
+  if (!best && QUESTION_SUBS.has(sub) && post.is_self && (QUESTION.test(post.title) || EITHER_OR.test(post.title))) {
+    best = { tag: `question in r/${post.subreddit}`, weight: 6 };
   }
   if (!best) return null;
 
